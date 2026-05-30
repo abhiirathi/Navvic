@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+export const maxDuration = 30;
 
 const MODEL = "gemini-2.5-flash";
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
@@ -13,32 +14,64 @@ const COUNTRIES: Record<string, string> = {
   GENERIC: "a generic 8-digit national tariff line",
 };
 
+const codeLevel = {
+  type: "object",
+  properties: { code: { type: "string" }, title: { type: "string" } },
+  required: ["code", "title"],
+};
+
 const responseSchema = {
   type: "object",
   properties: {
-    normalized_product: { type: "string" },
-    candidates: {
+    status: { type: "string", enum: ["needs_clarification", "classified"] },
+    product: { type: "string", description: "Short label for the product, e.g. 'Jeans (men's, woven cotton)'" },
+    questions: {
       type: "array",
+      description: "Only when status=needs_clarification. Up to 3 questions whose answers change the HS6 code.",
       items: {
         type: "object",
         properties: {
-          h2: { type: "string", description: "2-digit HS chapter" },
-          h2_desc: { type: "string" },
-          h4: { type: "string", description: "4-digit HS heading" },
-          h4_desc: { type: "string" },
-          h6: { type: "string", description: "6-digit HS subheading (WCO)" },
-          h6_desc: { type: "string" },
-          h8: { type: "string", description: "8-digit national tariff line" },
-          h8_desc: { type: "string" },
-          confidence: { type: "number", description: "0 to 1" },
-          rationale: { type: "string" },
+          id: { type: "string" },
+          question: { type: "string" },
+          why: { type: "string", description: "One short phrase on why this matters for classification" },
+          options: { type: "array", items: { type: "string" } },
         },
-        required: ["h2", "h2_desc", "h4", "h4_desc", "h6", "h6_desc", "h8", "h8_desc", "confidence", "rationale"],
+        required: ["id", "question", "options"],
       },
     },
-    notes: { type: "string" },
+    classification: {
+      type: "object",
+      description: "Only when status=classified.",
+      properties: {
+        recommended_hs6: { type: "string", description: "6-digit code formatted NNNN.NN" },
+        chapter: codeLevel,
+        heading: codeLevel,
+        subheadings: {
+          type: "array",
+          description: "ALL real WCO 6-digit subheadings under the chosen heading, in order.",
+          items: {
+            type: "object",
+            properties: {
+              code: { type: "string" },
+              title: { type: "string" },
+              recommended: { type: "boolean" },
+            },
+            required: ["code", "title", "recommended"],
+          },
+        },
+        tariff_lines: {
+          type: "array",
+          description: "National 8-digit tariff lines under the recommended subheading for the requested country.",
+          items: codeLevel,
+        },
+        confidence: { type: "number", description: "0 to 1" },
+        rationale: { type: "string" },
+        notes: { type: "string" },
+      },
+      required: ["recommended_hs6", "chapter", "heading", "subheadings", "confidence", "rationale"],
+    },
   },
-  required: ["normalized_product", "candidates", "notes"],
+  required: ["status", "product"],
 };
 
 export async function POST(req: NextRequest) {
@@ -50,7 +83,12 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  let body: { description?: string; country?: string };
+  let body: {
+    description?: string;
+    country?: string;
+    answers?: Record<string, string>;
+    image?: { mimeType: string; data: string };
+  };
   try {
     body = await req.json();
   } catch {
@@ -60,54 +98,67 @@ export async function POST(req: NextRequest) {
   const description = (body.description ?? "").trim();
   const countryKey = (body.country ?? "GENERIC").toUpperCase();
   const country = COUNTRIES[countryKey] ?? COUNTRIES.GENERIC;
+  const answers = body.answers ?? {};
+  const image = body.image;
 
-  if (description.length < 3) {
-    return NextResponse.json({ error: "Please describe the product (at least a few words)." }, { status: 400 });
+  if (description.length < 3 && !image) {
+    return NextResponse.json(
+      { error: "Describe the product (a few words) or upload a product image." },
+      { status: 400 }
+    );
   }
 
-  const prompt = `You are an expert customs broker and classifier specialising in the World Customs Organization Harmonized System (HS).
+  const answersText = Object.keys(answers).length
+    ? `\n\nThe user has already answered these clarifying questions:\n${Object.entries(answers)
+        .map(([q, a]) => `- ${q}: ${a}`)
+        .join("\n")}`
+    : "";
 
-Given a plain-English product description, return the most likely HS classifications, ordered most-likely first. Return up to 3 candidate classifications.
+  const prompt = `You are a senior customs broker and an expert in the WCO Harmonized System. Classify products with maximum accuracy, applying the General Rules of Interpretation (GRI), Section and Chapter Notes, and legal texts.
 
-For EACH candidate provide the full hierarchy:
-- h2: the 2-digit HS Chapter code, with h2_desc = official chapter title
-- h4: the 4-digit HS Heading code (formatted "NN.NN"), with h4_desc
-- h6: the 6-digit international HS Subheading (formatted "NNNN.NN"), with h6_desc
-- h8: an 8-digit national tariff line for ${country} (formatted "NNNN.NN.NN"), with h8_desc
-- confidence: a number from 0 to 1
-- rationale: ONE concise sentence on why this classification fits
+ACCURACY FIRST. Many products are ambiguous and the correct HS6 depends on details the user has not stated. Common decisive factors:
+- Knitted/crocheted (Chapter 61) vs woven (Chapter 62) — e.g. denim jeans are usually WOVEN cotton trousers => heading 62.03/62.04, NOT 61.03.
+- Gender/age (men's/boys' vs women's/girls'), which splits headings.
+- Constituent material (cotton vs synthetic vs wool), processing (fresh/frozen/dried), form, function, and intended use.
 
-Also return:
-- normalized_product: a cleaned, customs-style description of the product
-- notes: any classifying assumptions and a brief reminder that codes are indicative and must be verified against the official tariff schedule.
+DECISION:
+- If the description is missing any detail that would change the 6-digit code, set status="needs_clarification" and return up to 3 short, mutually-exclusive multiple-choice questions (each with an "id", the "question", a one-phrase "why", and 2-5 "options"). Put the most likely option first. Do NOT ask about things that don't affect the HS6.
+- If you have enough information (including the user's answers below), set status="classified".
 
-The 8-digit codes are national and may vary; give the most plausible line and state assumptions in notes if unsure.
+When status="classified", return:
+- recommended_hs6: the single best 6-digit subheading.
+- chapter: {code (2-digit), title} and heading: {code (4-digit, formatted NN.NN), title} — use the official WCO chapter/heading titles.
+- subheadings: EVERY real 6-digit subheading that exists under the chosen 4-digit heading (official WCO codes formatted NNNN.NN and their official titles), in numeric order, with recommended=true on exactly one.
+- tariff_lines: the plausible 8-digit national tariff lines under the recommended subheading for ${country} (formatted NNNN.NN.NN). If unsure, give the most likely lines.
+- confidence (0-1), rationale (one or two sentences), notes (assumptions + reminder to verify against the official tariff).
 
-Product description: """${description}"""`;
+Always set "product" to a concise label (e.g. "Jeans (men's, woven cotton)").
+
+${image ? "An image of the product is attached. Identify the commodity from the image, combining it with any text the user provided. If the image is unclear or a decisive detail (material, knitted vs woven, gender, etc.) is not visible, ask a clarifying question rather than guessing." : ""}
+Product description: """${description || "(none provided — rely on the attached image)"}"""${answersText}`;
+
+  const parts: Array<Record<string, unknown>> = [{ text: prompt }];
+  if (image?.data && image?.mimeType) {
+    parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
+  }
 
   try {
     const res = await fetch(ENDPOINT, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.2,
-          responseMimeType: "application/json",
-          responseSchema,
-        },
+        contents: [{ parts }],
+        generationConfig: { temperature: 0.1, responseMimeType: "application/json", responseSchema },
       }),
     });
 
     if (!res.ok) {
       const detail = await res.text();
-      return NextResponse.json(
-        { error: `Gemini API error (${res.status}).`, detail: detail.slice(0, 400) },
-        { status: 502 }
-      );
+      const msg =
+        res.status === 429
+          ? "Gemini free-tier rate limit hit. Please wait a moment and try again."
+          : `Gemini API error (${res.status}).`;
+      return NextResponse.json({ error: msg, detail: detail.slice(0, 300) }, { status: 502 });
     }
 
     const data = await res.json();
