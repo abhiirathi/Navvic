@@ -9,7 +9,7 @@ import ThemeToggle from "./ThemeToggle";
 const links = [
   { href: "/#products", label: "Products" },
   { href: "/#services", label: "Logistics" },
-  { href: "/#network", label: "Network" },
+  { href: "/tools", label: "Tools" },
   { href: "/products", label: "Catalog" },
 ];
 
