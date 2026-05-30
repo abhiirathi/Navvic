@@ -37,9 +37,10 @@ export default function HsCodePage() {
             HS Code <span className="gradient-text">Classifier</span>
           </h1>
           <p className="mt-4 max-w-2xl text-muted">
-            Describe any product the way you'd say it out loud. Navvic's classifier maps it to the
-            full Harmonized System hierarchy — Chapter (H2), Heading (H4), Subheading (H6) and the
-            national tariff line (H8) — so you can quote duties and file paperwork faster.
+            Describe any product the way you'd say it out loud — or just upload a photo. Navvic's
+            classifier maps it to the full Harmonized System hierarchy — Chapter (H2), Heading (H4),
+            Subheading (H6) and the national tariff line (H8) — so you can quote duties and file
+            paperwork faster.
           </p>
 
           <div className="mt-10">
